@@ -1,5 +1,7 @@
 * text=auto
+.gitattributes text eol=lf
 *.sh text eol=lf
+*.asc text eol=lf
 Dockerfile text eol=lf
 README.md text eol=lf
 *.yml text eol=lf

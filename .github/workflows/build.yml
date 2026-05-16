@@ -33,23 +33,64 @@ jobs:
       - name: Resolve TrustTunnel release
         id: release
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTTUNNEL_VERSION: ${{ github.event.inputs.trusttunnel_version || '' }}
         run: |
-          version="${{ github.event.inputs.trusttunnel_version }}"
-          if [ -z "$version" ]; then
-            version="$(curl -fsSL https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest | jq -r .tag_name)"
+          set -euo pipefail
+
+          api_headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          explicit_version=false
+          version="${TRUSTTUNNEL_VERSION}"
+          if [ -n "$version" ]; then
+            explicit_version=true
+            version="${version#v}"
+            release_url="https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/tags/v${version}"
+          else
+            release_url="https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest"
           fi
-          version="${version#v}"
+
+          release_json="$(mktemp)"
+          curl -fsSL "${api_headers[@]}" "$release_url" -o "$release_json"
+
+          if [ -z "$version" ]; then
+            version="$(jq -r .tag_name "$release_json")"
+            version="${version#v}"
+          fi
+
           if [ -z "$version" ] || [ "$version" = "null" ]; then
             echo "Could not resolve TrustTunnel release version" >&2
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          release_asset_digest() {
+            local asset_name="$1"
+            local digest
+            digest="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest // empty' "$release_json")"
+            digest="${digest#sha256:}"
+            if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+              echo "Could not resolve SHA256 digest for ${asset_name}" >&2
+              exit 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          amd64_asset="trusttunnel-v${version}-linux-x86_64.tar.gz"
+          arm64_asset="trusttunnel-v${version}-linux-aarch64.tar.gz"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$explicit_version" = "true" ]; then
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha256_amd64=$(release_asset_digest "$amd64_asset")" >> "$GITHUB_OUTPUT"
+          echo "sha256_arm64=$(release_asset_digest "$arm64_asset")" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -57,21 +98,94 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          pull: true
+          build-args: |
+            TT_VERSION=${{ steps.release.outputs.version }}
+            TT_SHA256_AMD64=${{ steps.release.outputs.sha256_amd64 }}
+            TT_SHA256_ARM64=${{ steps.release.outputs.sha256_arm64 }}
+          tags: trusttunnel-smoke:${{ github.sha }}
+
+      - name: Smoke test image
+        shell: bash
+        env:
+          TT_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          image="trusttunnel-smoke:${GITHUB_SHA}"
+          actual_version="$(docker run --rm "$image" --version)"
+          if [ "$actual_version" != "$TT_VERSION" ]; then
+            echo "Expected TrustTunnel version ${TT_VERSION}, got ${actual_version}" >&2
+            exit 1
+          fi
+
+          docker run --rm "$image" setup_wizard --help >/tmp/setup_wizard_help.txt
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Prepare Docker tags
+        id: docker_tags
+        shell: bash
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IS_LATEST_RELEASE: ${{ steps.release.outputs.is_latest }}
+          TT_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          image="${DOCKER_USERNAME}/${IMAGE_NAME}"
+          publish_latest="${IS_LATEST_RELEASE}"
+          publish_version_tags=true
+
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            if docker buildx imagetools inspect "${image}:${TT_VERSION}" >/dev/null 2>&1 \
+              || docker buildx imagetools inspect "${image}:v${TT_VERSION}" >/dev/null 2>&1; then
+              publish_version_tags=false
+            fi
+          fi
+
+          {
+            echo "tags<<EOF"
+            if [ "$publish_latest" = "true" ]; then
+              echo "${image}:latest"
+            fi
+            if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+              echo "${image}:rebuild-${TT_VERSION}-$(date -u +%Y%m%d)"
+            fi
+            if [ "$publish_version_tags" = "true" ]; then
+              echo "${image}:${TT_VERSION}"
+              echo "${image}:v${TT_VERSION}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          pull: true
           build-args: |
             TT_VERSION=${{ steps.release.outputs.version }}
+            TT_SHA256_AMD64=${{ steps.release.outputs.sha256_amd64 }}
+            TT_SHA256_ARM64=${{ steps.release.outputs.sha256_arm64 }}
           push: true
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.release.outputs.version }}
-            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:v${{ steps.release.outputs.version }}
+          tags: ${{ steps.docker_tags.outputs.tags }}
           labels: |
             org.opencontainers.image.title=TrustTunnel Endpoint
             org.opencontainers.image.description=Unofficial Docker image for the TrustTunnel endpoint
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.release.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
