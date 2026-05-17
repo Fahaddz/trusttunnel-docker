@@ -87,16 +87,14 @@ docker run --rm -it -v "$(pwd)/config:/config" fahaddz/trusttunnel \
 ## Tags
 
 - `latest` tracks the latest upstream TrustTunnel release and is rebuilt by the
-  scheduled workflow.
+  scheduled workflow only when a new upstream release is found.
 - `<version>` and `v<version>` point to a specific TrustTunnel release, for
   example `1.0.33` and `v1.0.33`.
-- `rebuild-<version>-<date>` is produced by the daily scheduled workflow, for
-  example `rebuild-1.0.33-20260516`.
 
-Scheduled builds do not overwrite existing version tags. They always publish
-`latest` and the dated rebuild tag. If the upstream latest release is new and
-its version tags do not exist yet, the scheduled workflow publishes those tags
-once.
+Scheduled builds resolve the upstream latest release and run the build checks
+daily. If that release's version tags already exist on Docker Hub, the workflow
+stops before pushing. If the upstream latest release is new, the scheduled
+workflow publishes `latest`, `<version>`, and `v<version>` once.
 
 Manual workflow runs with a specific `trusttunnel_version` publish only that
 release's version tags. They do not move `latest` backward.

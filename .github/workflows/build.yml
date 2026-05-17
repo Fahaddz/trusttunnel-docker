@@ -147,23 +147,23 @@ jobs:
           image="${DOCKER_USERNAME}/${IMAGE_NAME}"
           publish_latest="${IS_LATEST_RELEASE}"
           publish_version_tags=true
+          should_push=true
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             if docker buildx imagetools inspect "${image}:${TT_VERSION}" >/dev/null 2>&1 \
               || docker buildx imagetools inspect "${image}:v${TT_VERSION}" >/dev/null 2>&1; then
               publish_version_tags=false
+              should_push=false
             fi
           fi
 
+          echo "should_push=${should_push}" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
-            if [ "$publish_latest" = "true" ]; then
+            if [ "$should_push" = "true" ] && [ "$publish_latest" = "true" ]; then
               echo "${image}:latest"
             fi
-            if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-              echo "${image}:rebuild-${TT_VERSION}-$(date -u +%Y%m%d)"
-            fi
-            if [ "$publish_version_tags" = "true" ]; then
+            if [ "$should_push" = "true" ] && [ "$publish_version_tags" = "true" ]; then
               echo "${image}:${TT_VERSION}"
               echo "${image}:v${TT_VERSION}"
             fi
@@ -171,6 +171,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
+        if: steps.docker_tags.outputs.should_push == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
